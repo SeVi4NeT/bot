@@ -8,13 +8,9 @@ from bs4 import BeautifulSoup
 from telegram import InputFile, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import Updater, CommandHandler, CallbackQueryHandler
 
-# === ДОП. ИМПОРТЫ ДЛЯ /when ===
 from datetime import datetime, date, time as dtime, timedelta
 import pytz   # pip install pytz
 TZ = pytz.timezone("Europe/Kyiv")
-
-# Playwright для рендера JS (fallback)
-from playwright.sync_api import sync_playwright
 
 warnings.filterwarnings("ignore", category=UserWarning, module="telegram.utils.request")
 
@@ -22,8 +18,7 @@ warnings.filterwarnings("ignore", category=UserWarning, module="telegram.utils.r
 BOT_TOKEN = "8328849866:AAEL0hvWYv-esVYVXTHVQ9rnl-kc-IImAIY"
 PAGE_URL = "https://off.energy.mk.ua"
 CHECK_INTERVAL_MIN = 1
-# "#tabSchedule table", ".tabSchedule .table-sm.table-bordered"
-TABLE_SELECTOR = ""   # оставь пустым — бот сам найдёт таблицу по "Час"
+TABLE_SELECTOR = ""   # пусть бот сам найдёт таблицу по "Час"
 
 # --- папка данных в профиле пользователя ---
 DATA_DIR = Path(os.getenv("LOCALAPPDATA", str(Path.home()))) / "offenergy-bot"
@@ -48,7 +43,7 @@ def save_json(path: Path, data):
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(path.suffix + ".tmp")
         tmp.write_text(txt, encoding="utf-8")
-        tmp.replace(path)  # атомная замена
+        tmp.replace(path)
     except PermissionError:
         fallback = Path(tempfile.gettempdir()) / ("offenergy-bot_" + path.name)
         fallback.write_text(txt, encoding="utf-8")
@@ -107,35 +102,20 @@ def _looks_unrendered(headers, rows):
     return count_tpl >= 2
 
 def fetch_table():
-    # 1) пробуем обычный GET
+    # 1) обычный GET
     r = requests.get(
         PAGE_URL, timeout=60,
-        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+        headers={"User-Agent": "Mozilla/5.0 (Linux; Android) AppleWebKit/537.36 Chrome/124 Mobile Safari/537.36"}
     )
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "lxml")
     headers, rows = _extract_table_from_soup(soup)
 
-    # 2) если таблица не найдена или выглядит «сырой», рендерим через Playwright
-    if headers is None or _looks_unrendered(headers, rows):
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            ctx = browser.new_context()
-            page = ctx.new_page()
-            page.goto(PAGE_URL, wait_until="load", timeout=30000)
-            try:
-                sel = TABLE_SELECTOR or "table"
-                page.wait_for_selector(sel, timeout=20000)
-            except Exception:
-                pass
-            html = page.content()
-            browser.close()
-        soup2 = BeautifulSoup(html, "lxml")
-        headers, rows = _extract_table_from_soup(soup2)
+    # 2) На телефоне Playwright не используем (специально не импортируем).
+    # Если страница когда-то станет полностью на JS — эту часть можно вернуть.
 
     if not headers or not rows:
         raise RuntimeError("Не удалось найти таблицу на странице")
-
     return headers, rows
 
 def table_signature(headers, rows):
@@ -160,13 +140,11 @@ def diff_tables(prev_headers, prev_rows, headers, rows, cap=30):
                     changes_preview.append((time_val, col, old.split("{")[0], new.split("{")[0]))
     return changes_preview, changes_all
 
-# ========= ФУНКЦИИ ДЛЯ /when =========
+# ========= /when: цвет -> состояние =========
 def clean_cell(val: str) -> str:
     return val.split("{", 1)[0].strip() if val else ""
 
-# --- ЦВЕТ -> СОСТОЯНИЕ ---
 def _parse_cell_meta(val: str):
-    """Разбор хвоста {classes|style} -> (classes, style) в lowercase."""
     classes, style = "", ""
     if val and "{" in val and "}" in val:
         meta = val.split("{", 1)[1].split("}", 1)[0]
@@ -175,44 +153,36 @@ def _parse_cell_meta(val: str):
         style   = (parts[1] if len(parts) > 1 else "").lower()
     return classes, style
 
+# точные оттенки и классы со страницы
 def _is_on_by_color(classes: str, style: str) -> bool:
-    """Зелёный = є світло. Учитываем точные классы/цвета страницы."""
     c = classes.lower().strip()
     s = style.lower().replace(" ", "")
-    # точные правила
-    if "item-enable" in c:
+    if "item-enable" in c or "#a1eebd" in s or "rgb(161,238,189)" in s:
         return True
-    if "#a1eebd" in s or "rgb(161,238,189)" in s:
+    if any(k in c for k in ("table-success","bg-success","text-bg-success","green")):
         return True
-    # запасные общие признаки
-    if any(k in c for k in ("table-success", "bg-success", "text-bg-success", "green")):
-        return True
-    if any(h in s for h in ("#28a745", "#198754", "#2ecc71", "#00ff00", "background:green", "background-color:green")):
+    if any(h in s for h in ("#28a745","#198754","#2ecc71","#00ff00","background:green","background-color:green")):
         return True
     return False
 
 def _is_off_by_color(classes: str, style: str) -> bool:
-    """Жёлтый/красный = немає світла. Учитываем точные классы/цвета страницы."""
     c = classes.lower().strip()
     s = style.lower().replace(" ", "")
-    # точные правила
     if "item-off" in c or "item-probably" in c:
         return True
-    if ("#f6d6d6" in s or "rgb(246,214,214)" in s or   # красный
-        "#f6f7c4" in s or "rgb(246,247,196)" in s):     # жёлтый
+    if ("#f6d6d6" in s or "rgb(246,214,214)" in s or
+        "#f6f7c4" in s or "rgb(246,247,196)" in s):
         return True
-    # запасные общие признаки
-    if any(k in c for k in ("table-warning", "table-danger", "bg-warning", "bg-danger",
-                            "text-bg-warning", "text-bg-danger", "warning", "danger", "yellow", "red")):
+    if any(k in c for k in ("table-warning","table-danger","bg-warning","bg-danger",
+                            "text-bg-warning","text-bg-danger","warning","danger","yellow","red")):
         return True
-    if any(h in s for h in ("#ffc107", "#ffcc00", "#f1c40f", "#dc3545", "#ff0000",
-                            "background:yellow", "background-color:yellow",
-                            "background:red", "background-color:red")):
+    if any(h in s for h in ("#ffc107","#ffcc00","#f1c40f","#dc3545","#ff0000",
+                            "background:yellow","background-color:yellow",
+                            "background:red","background-color:red")):
         return True
     return False
 
 def _cell_state_by_color(queue_name: str, val: str) -> str:
-    """'on'/'off' по цвету; fallback — сравнение текста с названием очереди."""
     text = clean_cell(val)
     classes, style = _parse_cell_meta(val)
     if _is_off_by_color(classes, style):
@@ -222,8 +192,7 @@ def _cell_state_by_color(queue_name: str, val: str) -> str:
     return "off" if text == queue_name else "on"
 
 def parse_time_range(s: str):
-    """Парсинг 'HH:MM-HH:MM' или 'HH:MM–HH:MM' (любой дефис/пробелы)."""
-    s = str(s).strip().replace("–", "-").replace("—", "-").replace(" ", "").replace("\xa0", "")
+    s = str(s).strip().replace("–","-").replace("—","-").replace(" ","").replace("\xa0","")
     if not s or "-" not in s:
         return None, None
     try:
@@ -244,7 +213,7 @@ def build_schedule_map(headers, rows):
         return [], {}
     times = []
     norm_headers = [_clean_text(h) for h in headers]
-    cols = {h: [] for h in norm_headers[1:]}  # без первого столбца времени
+    cols = {h: [] for h in norm_headers[1:]}
     for r in rows:
         tr = clean_cell(r[0]) if r else ""
         start, end = parse_time_range(tr)
@@ -263,12 +232,6 @@ def _column_index(headers, q):
     return -1
 
 def intervals_for_queue(queue_name: str, headers, rows):
-    """
-    Возвращает интервалы:
-      [ (start_dt, end_dt, 'off'|'on') ]
-    Правило: цвет ячейки — главный (зелёный=on, жёлтый/красный=off).
-    Если цвета нет — fallback по тексту.
-    """
     times, cols = build_schedule_map(headers, rows)
     q = _clean_text(queue_name)
     if q not in cols or not times:
@@ -294,8 +257,7 @@ def intervals_for_queue(queue_name: str, headers, rows):
 
 def format_intervals_readable(items, limit=16, from_now_only=True):
     now = datetime.now(TZ)
-    out = []
-    shown = 0
+    out, shown = [], 0
     for s, e, state in items:
         if from_now_only and e <= now:
             continue
@@ -304,10 +266,7 @@ def format_intervals_readable(items, limit=16, from_now_only=True):
         shown += 1
         if shown >= limit:
             break
-    if not out:
-        return "На сьогодні інтервали не знайдені."
-    return "\n".join(out)
-# ========= КОНЕЦ БЛОКА /when =========
+    return "\n".join(out) if out else "На сьогодні інтервали не знайдені."
 
 # -------- КНОПКИ / МЕНЮ --------
 def build_main_menu(chat_id: int):
@@ -321,7 +280,6 @@ def build_main_menu(chat_id: int):
     return InlineKeyboardMarkup(keyboard)
 
 def _known_columns():
-    """Вернуть список доступных колонок (без первого столбца времени)."""
     cols = []
     if STATE.get("headers"):
         cols = [_clean_text(h) for h in STATE["headers"][1:]]
@@ -329,7 +287,6 @@ def _known_columns():
 
 def build_queue_keyboard():
     cols = _known_columns()
-    # если ещё не загружено — попробуем подгрузить
     if not cols:
         try:
             headers, rows = fetch_table()
@@ -339,9 +296,7 @@ def build_queue_keyboard():
         except Exception:
             cols = []
     if not cols:
-        # запасной набор кнопок
         cols = [f"{a}.{b}" for a in range(1,7) for b in (1,2)]
-    # раскладываем по 4 кнопки в ряд
     rows = []
     row = []
     for i, c in enumerate(cols, 1):
@@ -353,6 +308,7 @@ def build_queue_keyboard():
     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="menu:main")])
     return InlineKeyboardMarkup(rows)
 
+# -------- уведомления и джоб --------
 def notify(context, text, csv_rows=None):
     bot = context.bot
     dead = []
@@ -360,24 +316,13 @@ def notify(context, text, csv_rows=None):
         try:
             if csv_rows:
                 bio = BytesIO()
-                w = csv.writer(bio)
-                w.writerow(["time","column","old","new"])
-                for r in csv_rows:
-                    w.writerow(r)
+                w = csv.writer(bio); w.writerow(["time","column","old","new"])
+                for r in csv_rows: w.writerow(r)
                 bio.seek(0)
-                bot.send_document(
-                    chat_id=chat_id,
-                    document=InputFile(bio, filename="table_diff.csv"),
-                    caption=text[:1024],
-                    parse_mode='HTML'
-                )
+                bot.send_document(chat_id=chat_id, document=InputFile(bio, filename="table_diff.csv"),
+                                  caption=text[:1024], parse_mode='HTML')
             else:
-                bot.send_message(
-                    chat_id=chat_id,
-                    text=text,
-                    parse_mode='HTML',
-                    disable_web_page_preview=False
-                )
+                bot.send_message(chat_id=chat_id, text=text, parse_mode='HTML', disable_web_page_preview=False)
         except Exception:
             dead.append(chat_id)
     for d in dead:
@@ -407,7 +352,7 @@ def check_job(context):
                 msg.append(f"• <code>{t}</code> — <b>{c}</b>: <code>{o or '—'}</code> → <code>{n or '—'}</code>")
         notify(context, "\n".join(msg), csv_rows)
 
-# ---------- КОМАНДЫ ----------
+# ---------- команды ----------
 def start_cmd(update, context):
     chat_id = update.effective_chat.id
     text = (f"Привіт! Відстежую таблицю {PAGE_URL}. Перевірка кожні {CHECK_INTERVAL_MIN} хв.\n"
@@ -424,14 +369,12 @@ def check_cmd(update, context):
     update.message.reply_text("Перевірив.", reply_markup=build_main_menu(update.effective_chat.id))
 
 def when_cmd(update, context):
-    """Текстовая версия: /when 4.1"""
-    global STATE
     args = context.args or []
     if not args:
         update.message.reply_text("Використання: /when <черга>\nНапр.: /when 1.1 або /when 5.2")
         return
     queue = args[0].strip()
-    if not STATE:
+    if not STATE.get("headers"):
         try:
             headers, rows = fetch_table()
             STATE.update({"headers": headers, "rows": rows})
@@ -449,7 +392,46 @@ def when_cmd(update, context):
     text = f"<b>Черга {queue} — сьогодні</b>\n" + format_intervals_readable(intervals)
     update.message.reply_text(text, parse_mode='HTML', reply_markup=build_main_menu(update.effective_chat.id))
 
-# ---------- CALLBACKS (кнопки) ----------
+def simulate_change_cmd(update, context):
+    """Локальная симуляция изменения таблицы и рассылка уведомления."""
+    global STATE
+    try:
+        if not STATE or not STATE.get("headers") or not STATE.get("rows"):
+            headers, rows = fetch_table()
+            STATE = {"sha256": table_signature(headers, rows),
+                     "headers": headers, "rows": rows, "ts": int(time.time())}
+            save_json(STATE_FILE, STATE)
+
+        old_headers = STATE["headers"]; old_rows = STATE["rows"]
+        headers = old_headers[:]; rows = [r[:] for r in old_rows]
+        if not rows or len(rows[0]) < 2:
+            update.message.reply_text("Недостатньо даних для симуляції.")
+            return
+        cell = rows[0][1]
+        parts = cell.split("{", 1)
+        text = parts[0].strip()
+        meta = "{" + parts[1] if len(parts) > 1 else ""
+        marker = " (test)"
+        text = text[:-len(marker)] if text.endswith(marker) else (text + marker)
+        rows[0][1] = (text + meta).strip()
+
+        preview, csv_rows = diff_tables(old_headers, old_rows, headers, rows)
+        STATE = {"sha256": table_signature(headers, rows),
+                 "headers": headers, "rows": rows, "ts": int(time.time())}
+        save_json(STATE_FILE, STATE)
+
+        msg = [f"<b>Таблиця оновлена (симуляція)</b>\n<a href='{PAGE_URL}'>Відкрити</a>",
+               f"Змінено ячейок: {len(csv_rows)}"]
+        if preview:
+            msg.append("<b>Перші зміни:</b>")
+            for t, c, o, n in preview[:10]:
+                msg.append(f"• <code>{t}</code> — <b>{c}</b>: <code>{o or '—'}</code> → <code>{n or '—'}</code>")
+        notify(context, "\n".join(msg), csv_rows)
+        update.message.reply_text("Симуляцію виконано. Надіслано сповіщення ✅", parse_mode='HTML')
+    except Exception as e:
+        update.message.reply_text(f"Помилка симуляції: {e}")
+
+# ---------- CALLBACK кнопок ----------
 def button_cb(update, context):
     global STATE, SUBSCRIBERS
     q = update.callback_query
@@ -458,59 +440,36 @@ def button_cb(update, context):
     try:
         if data == "sub:toggle":
             if chat_id in SUBSCRIBERS:
-                SUBSCRIBERS.discard(chat_id)
-                save_json(SUBSCRIBERS_FILE, list(SUBSCRIBERS))
-                q.answer("Сповіщення вимкнено")
+                SUBSCRIBERS.discard(chat_id); q.answer("Сповіщення вимкнено")
             else:
-                SUBSCRIBERS.add(chat_id)
-                save_json(SUBSCRIBERS_FILE, list(SUBSCRIBERS))
-                q.answer("Сповіщення увімкнено")
-            q.edit_message_reply_markup(reply_markup=build_main_menu(chat_id))
-            return
-
+                SUBSCRIBERS.add(chat_id); q.answer("Сповіщення увімкнено")
+            save_json(SUBSCRIBERS_FILE, list(SUBSCRIBERS))
+            q.edit_message_reply_markup(reply_markup=build_main_menu(chat_id)); return
         if data == "menu:queues":
-            q.answer()
-            q.edit_message_text("Оберіть вашу чергу:", reply_markup=build_queue_keyboard())
-            return
-
+            q.answer(); q.edit_message_text("Оберіть вашу чергу:", reply_markup=build_queue_keyboard()); return
         if data == "menu:main":
             q.answer()
             q.edit_message_text(
                 f"Привіт! Відстежую таблицю {PAGE_URL}. Перевірка кожні {CHECK_INTERVAL_MIN} хв.\n"
                 f"Вибери дію кнопками нижче.",
-                reply_markup=build_main_menu(chat_id),
-                disable_web_page_preview=True
-            )
-            return
-
+                reply_markup=build_main_menu(chat_id), disable_web_page_preview=True
+            ); return
         if data == "action:check":
-            q.answer("Перевіряю…")
-            check_job(context)
-            q.edit_message_reply_markup(reply_markup=build_main_menu(chat_id))
-            return
-
+            q.answer("Перевіряю…"); check_job(context)
+            q.edit_message_reply_markup(reply_markup=build_main_menu(chat_id)); return
         if data.startswith("qsel:"):
             queue = data.split(":", 1)[1]
-            # убедимся, что таблица есть
             if not STATE.get("headers"):
                 try:
                     headers, rows = fetch_table()
-                    STATE.update({"headers": headers, "rows": rows})
-                    save_json(STATE_FILE, STATE)
+                    STATE.update({"headers": headers, "rows": rows}); save_json(STATE_FILE, STATE)
                 except Exception:
-                    q.answer("Не вдалося завантажити таблицю")
-                    return
-            headers = STATE.get("headers", [])
-            rows = STATE.get("rows", [])
-            intervals, known_cols = intervals_for_queue(queue, headers, rows)
-            if not intervals:
-                q.answer("Чергу не знайдено")
-                return
+                    q.answer("Не вдалося завантажити таблицю"); return
+            headers = STATE.get("headers", []); rows = STATE.get("rows", [])
+            intervals, _ = intervals_for_queue(queue, headers, rows)
+            if not intervals: q.answer("Чергу не знайдено"); return
             text = f"<b>Черга {queue} — сьогодні</b>\n" + format_intervals_readable(intervals)
-            q.edit_message_text(text, parse_mode='HTML', reply_markup=build_queue_keyboard())
-            return
-
-        # на всякий
+            q.edit_message_text(text, parse_mode='HTML', reply_markup=build_queue_keyboard()); return
         q.answer()
     except Exception:
         q.answer("Сталася помилка")
@@ -525,6 +484,7 @@ def main():
     dp.add_handler(CommandHandler("stop", stop_cmd))
     dp.add_handler(CommandHandler("check", check_cmd))
     dp.add_handler(CommandHandler("when", when_cmd))
+    dp.add_handler(CommandHandler("simulate_change", simulate_change_cmd))
     dp.add_handler(CallbackQueryHandler(button_cb))
 
     updater.job_queue.run_repeating(check_job, interval=CHECK_INTERVAL_MIN*60, first=0)
