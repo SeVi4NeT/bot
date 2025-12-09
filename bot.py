@@ -1,6 +1,3 @@
-# -*- coding: utf-8 -*-
-# Совместим с python-telegram-bot v13.x (sync API, Updater/Dispatcher)
-
 import csv, hashlib, json, re, requests, time, warnings, os, tempfile
 from io import BytesIO
 from pathlib import Path
@@ -15,7 +12,7 @@ TZ = pytz.timezone("Europe/Kyiv")
 warnings.filterwarnings("ignore", category=UserWarning, module="telegram.utils.request")
 
 # === НАСТРОЙКИ ===
-BOT_TOKEN = "8328849866:AAEL0hvWYv-esVYVXTHVQ9rnl-kc-IImAIY"
+BOT_TOKEN = os.getenv("BOT_TOKEN") or "8328849866:AAEL0hvWYv-esVYVXTHVQ9rnl-kc-IImAIY"
 PAGE_URL = "https://off.energy.mk.ua"
 CHECK_INTERVAL_MIN = 1
 TABLE_SELECTOR = ""   # пусть бот сам найдёт таблицу по "Час"
@@ -27,6 +24,10 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 STATE_FILE = DATA_DIR / "state_table.json"
 SUBSCRIBERS_FILE = DATA_DIR / "subscribers.json"
 _whitespace_re = re.compile(r"\s+")
+_tpl_re = re.compile(r"\{\{.*?\}\}")
+
+def _strip_tpl(s: str) -> str:
+    return _tpl_re.sub("", s or "")
 
 def load_json(path: Path, default):
     if path.exists():
@@ -56,7 +57,7 @@ def _clean_text(s: str) -> str:
     return _whitespace_re.sub(" ", s.replace("\xa0", " ")).strip()
 
 def normalize_cell_text(tag, include_class=False):
-    text = _clean_text(tag.get_text(separator=" ", strip=True))
+    text = _clean_text(_strip_tpl(tag.get_text(separator=" ", strip=True)))
     if include_class:
         classes = " ".join(sorted(tag.get("class", [])))
         style = tag.get("style", "")
@@ -65,44 +66,36 @@ def normalize_cell_text(tag, include_class=False):
     return text
 
 def _extract_table_from_soup(soup):
-    table = soup.select_one(TABLE_SELECTOR) if TABLE_SELECTOR else None
-    if not table:
-        for t in soup.find_all("table"):
-            ths = [normalize_cell_text(th) for th in t.find_all("th")]
-            if ths and ("Час" in ths[0] or ths[0].lower().startswith("час")):
-                table = t
-                break
-        if not table:
-            table = soup.find("table")
-    if not table:
-        return None, None
+    candidates = []
+    if TABLE_SELECTOR:
+        t = soup.select_one(TABLE_SELECTOR)
+        if t: candidates.append(t)
+    candidates.extend(soup.find_all("table"))
 
-    headers = [normalize_cell_text(th) for th in table.find_all("th")]
-    rows = []
-    for tr in table.find_all("tr"):
-        tds = tr.find_all("td")
-        if not tds:
-            continue
-        rows.append([normalize_cell_text(td, include_class=True) for td in tds])
+    def good(headers, rows):
+        if not headers or not rows: return False
+        if any(("{{" in h) or ("}}" in h) for h in headers): return False
+        if any(any(("{{" in c) or ("}}" in c) for c in r) for r in rows[:10]): return False
+        h0 = (headers[0] or "").lower()
+        return ("час" in h0) or h0.startswith("час")
 
-    if not headers and rows:
-        headers = [f"col{i+1}" for i in range(len(rows[0]))]
-    return headers, rows
+    for t in candidates:
+        headers = [normalize_cell_text(th) for th in t.find_all("th")]
+        rows = []
+        for tr in t.find_all("tr"):
+            tds = tr.find_all("td")
+            if not tds: continue
+            rows.append([normalize_cell_text(td, include_class=True) for td in tds])
 
-def _looks_unrendered(headers, rows):
-    joined_h = " ".join(headers or [])
-    if "{{" in joined_h or "}}" in joined_h:
-        return True
-    if not headers or len(headers) <= 1:
-        return True
-    count_tpl = 0
-    for r in (rows or [])[:10]:
-        if any("{{" in c or "}}" in c for c in r):
-            count_tpl += 1
-    return count_tpl >= 2
+        if not headers and rows:
+            headers = [f"col{i+1}" for i in range(len(rows[0]))]
+
+        if good(headers, rows):
+            return headers, rows
+
+    return None, None
 
 def fetch_table():
-    # 1) обычный GET
     r = requests.get(
         PAGE_URL, timeout=60,
         headers={"User-Agent": "Mozilla/5.0 (Linux; Android) AppleWebKit/537.36 Chrome/124 Mobile Safari/537.36"}
@@ -110,12 +103,8 @@ def fetch_table():
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "lxml")
     headers, rows = _extract_table_from_soup(soup)
-
-    # 2) На телефоне Playwright не используем (специально не импортируем).
-    # Если страница когда-то станет полностью на JS — эту часть можно вернуть.
-
     if not headers or not rows:
-        raise RuntimeError("Не удалось найти таблицу на странице")
+        raise RuntimeError("Не удалось найти корректную таблицу на странице")
     return headers, rows
 
 def table_signature(headers, rows):
@@ -153,7 +142,6 @@ def _parse_cell_meta(val: str):
         style   = (parts[1] if len(parts) > 1 else "").lower()
     return classes, style
 
-# точные оттенки и классы со страницы
 def _is_on_by_color(classes: str, style: str) -> bool:
     c = classes.lower().strip()
     s = style.lower().replace(" ", "")
@@ -212,7 +200,7 @@ def build_schedule_map(headers, rows):
     if not headers or not rows:
         return [], {}
     times = []
-    norm_headers = [_clean_text(h) for h in headers]
+    norm_headers = [_clean_text(_strip_tpl(h)) for h in headers]
     cols = {h: [] for h in norm_headers[1:]}
     for r in rows:
         tr = clean_cell(r[0]) if r else ""
@@ -222,18 +210,18 @@ def build_schedule_map(headers, rows):
         times.append((start, end))
         for j, h in enumerate(norm_headers[1:], start=1):
             val = r[j] if j < len(r) else ""
-            cols[h].append(_clean_text(val))
+            cols[h].append(_clean_text(_strip_tpl(val)))
     return times, cols
 
 def _column_index(headers, q):
     for i, h in enumerate(headers):
-        if _clean_text(h) == q:
+        if _clean_text(_strip_tpl(h)) == q:
             return i
     return -1
 
 def intervals_for_queue(queue_name: str, headers, rows):
     times, cols = build_schedule_map(headers, rows)
-    q = _clean_text(queue_name)
+    q = _clean_text(_strip_tpl(queue_name))
     if q not in cols or not times:
         return [], list(cols.keys())
 
@@ -282,7 +270,8 @@ def build_main_menu(chat_id: int):
 def _known_columns():
     cols = []
     if STATE.get("headers"):
-        cols = [_clean_text(h) for h in STATE["headers"][1:]]
+        cols = [_clean_text(_strip_tpl(h)) for h in STATE["headers"][1:]]
+        cols = [c for c in cols if c and "{{" not in c and "}}" not in c]
     return cols
 
 def build_queue_keyboard():
@@ -292,7 +281,7 @@ def build_queue_keyboard():
             headers, rows = fetch_table()
             STATE.update({"headers": headers, "rows": rows})
             save_json(STATE_FILE, STATE)
-            cols = [_clean_text(h) for h in headers[1:]]
+            cols = [_clean_text(_strip_tpl(h)) for h in headers[1:]]
         except Exception:
             cols = []
     if not cols:
@@ -393,7 +382,7 @@ def when_cmd(update, context):
     update.message.reply_text(text, parse_mode='HTML', reply_markup=build_main_menu(update.effective_chat.id))
 
 def simulate_change_cmd(update, context):
-    """Локальная симуляция изменения таблицы и рассылка уведомления."""
+    """Локальна симуляція зміни таблиці та розсилка повідомлення."""
     global STATE
     try:
         if not STATE or not STATE.get("headers") or not STATE.get("rows"):
@@ -476,7 +465,7 @@ def button_cb(update, context):
 
 def main():
     if not BOT_TOKEN:
-        raise SystemExit("Укажи BOT_TOKEN в начале файла.")
+        raise SystemExit("Укажи токен через переменную окружения BOT_TOKEN.")
     updater = Updater(token=BOT_TOKEN, use_context=True)
     dp = updater.dispatcher
 
@@ -492,4 +481,12 @@ def main():
     updater.idle()
 
 if __name__ == "__main__":
+    # страховка: требуем совместимую версию urllib3
+    try:
+        import urllib3
+        v = tuple(int(x) for x in urllib3.__version__.split(".")[:2])
+        if v >= (2,0):
+            raise SystemExit("Нужен urllib3<2 для PTB 13.15. Установи: pip install 'urllib3<2'")
+    except Exception:
+        pass
     main()
