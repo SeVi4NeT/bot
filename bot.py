@@ -1,33 +1,43 @@
+# -*- coding: utf-8 -*-
 import csv, hashlib, json, re, requests, time, warnings, os, tempfile
 from io import BytesIO
 from pathlib import Path
 from bs4 import BeautifulSoup
 from telegram import InputFile, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import Updater, CommandHandler, CallbackQueryHandler
-
 from datetime import datetime, date, time as dtime, timedelta
-import pytz   # pip install pytz
-TZ = pytz.timezone("Europe/Kyiv")
+import pytz
 
-warnings.filterwarnings("ignore", category=UserWarning, module="telegram.utils.request")
-
-# === НАСТРОЙКИ ===
-BOT_TOKEN = os.getenv("BOT_TOKEN") or "8328849866:AAEL0hvWYv-esVYVXTHVQ9rnl-kc-IImAIY"
+# ===== НАСТРОЙКИ =====
+BOT_TOKEN = os.getenv("8328849866:AAEL0hvWYv-esVYVXTHVQ9rnl-kc-IImAIY") or "8328849866:AAEL0hvWYv-esVYVXTHVQ9rnl-kc-IImAIY"            # задай export BOT_TOKEN="xxx"
 PAGE_URL = "https://off.energy.mk.ua"
 CHECK_INTERVAL_MIN = 1
-TABLE_SELECTOR = ""   # пусть бот сам найдёт таблицу по "Час"
+TABLE_SELECTOR = "table.tabSchedule"                # точная таблица; есть фолбэк
 
-# --- папка данных в профиле пользователя ---
+# ===== ТАЙМЗОНА И ВАРНИНГИ =====
+TZ = pytz.timezone("Europe/Kyiv")
+warnings.filterwarnings("ignore", category=UserWarning, module="telegram.utils.request")
+
+# ===== ХРАНИЛКА СОСТОЯНИЙ =====
 DATA_DIR = Path(os.getenv("LOCALAPPDATA", str(Path.home()))) / "offenergy-bot"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
-
 STATE_FILE = DATA_DIR / "state_table.json"
 SUBSCRIBERS_FILE = DATA_DIR / "subscribers.json"
+
+# ===== УТИЛИТЫ =====
 _whitespace_re = re.compile(r"\s+")
 _tpl_re = re.compile(r"\{\{.*?\}\}")
+time_range_re = re.compile(r"^\s*\d{1,2}:\d{2}\s*[–—-]\s*\d{1,2}:\d{2}\s*$")
 
 def _strip_tpl(s: str) -> str:
     return _tpl_re.sub("", s or "")
+
+def _looks_time(s: str) -> bool:
+    return bool(time_range_re.match((s or "").replace("\xa0", " ").strip()))
+
+def _clean_text(s: str) -> str:
+    if not s: return ""
+    return _whitespace_re.sub(" ", s.replace("\xa0", " ")).strip()
 
 def load_json(path: Path, default):
     if path.exists():
@@ -38,7 +48,7 @@ def load_json(path: Path, default):
     return default
 
 def save_json(path: Path, data):
-    """Атомная запись JSON с запасным путём на случай запрета записи."""
+    """Атомная запись JSON; на случай отказа записи — падаем в tmp."""
     txt = json.dumps(data, ensure_ascii=False, indent=2)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -52,10 +62,6 @@ def save_json(path: Path, data):
 STATE = load_json(STATE_FILE, {})
 SUBSCRIBERS = set(load_json(SUBSCRIBERS_FILE, []))
 
-def _clean_text(s: str) -> str:
-    if not s: return ""
-    return _whitespace_re.sub(" ", s.replace("\xa0", " ")).strip()
-
 def normalize_cell_text(tag, include_class=False):
     text = _clean_text(_strip_tpl(tag.get_text(separator=" ", strip=True)))
     if include_class:
@@ -65,19 +71,42 @@ def normalize_cell_text(tag, include_class=False):
             text = f"{text}{{{classes}|{style}}}"
     return text
 
+# ===== ПАРСИНГ ТАБЛИЦЫ =====
 def _extract_table_from_soup(soup):
+    """Ищем нужную таблицу:
+    1) по TABLE_SELECTOR
+    2) по эвристикам: 1-я колонка похожа на 'HH:MM–HH:MM', нет {{...}} в первых строках
+    """
     candidates = []
     if TABLE_SELECTOR:
         t = soup.select_one(TABLE_SELECTOR)
         if t: candidates.append(t)
     candidates.extend(soup.find_all("table"))
 
+    def make_headers_from_rows(rows):
+        if not rows: return []
+        cols = len(rows[0])
+        first_col = [clean_cell(r[0]) for r in rows[:6] if r]
+        if sum(1 for x in first_col if _looks_time(x)) >= 2:
+            return ["Час"] + [f"col{i}" for i in range(2, cols + 1)]
+        return [f"col{i}" for i in range(1, cols + 1)]
+
+    def contaminated(headers, rows):
+        if any(("{{" in (h or "")) or ("}}" in (h or "")) for h in headers):
+            return True
+        for r in rows[:10]:
+            if any(("{{" in c) or ("}}" in c) for c in r):
+                return True
+        return False
+
     def good(headers, rows):
-        if not headers or not rows: return False
-        if any(("{{" in h) or ("}}" in h) for h in headers): return False
-        if any(any(("{{" in c) or ("}}" in c) for c in r) for r in rows[:10]): return False
+        if not rows: return False
+        if contaminated(headers, rows): return False
+        # либо явный 'Час' в заголовке, либо 1-я колонка похожа на интервалы времени
         h0 = (headers[0] or "").lower()
-        return ("час" in h0) or h0.startswith("час")
+        time_like = sum(1 for r in rows[:8] if r and _looks_time(clean_cell(r[0]))) >= 2
+        header_ok = ("час" in h0) or h0.startswith("час")
+        return header_ok or time_like
 
     for t in candidates:
         headers = [normalize_cell_text(th) for th in t.find_all("th")]
@@ -86,13 +115,10 @@ def _extract_table_from_soup(soup):
             tds = tr.find_all("td")
             if not tds: continue
             rows.append([normalize_cell_text(td, include_class=True) for td in tds])
-
-        if not headers and rows:
-            headers = [f"col{i+1}" for i in range(len(rows[0]))]
-
+        if (not headers) and rows:
+            headers = make_headers_from_rows(rows)
         if good(headers, rows):
             return headers, rows
-
     return None, None
 
 def fetch_table():
@@ -129,7 +155,7 @@ def diff_tables(prev_headers, prev_rows, headers, rows, cap=30):
                     changes_preview.append((time_val, col, old.split("{")[0], new.split("{")[0]))
     return changes_preview, changes_all
 
-# ========= /when: цвет -> состояние =========
+# ===== ЛОГИКА /when =====
 def clean_cell(val: str) -> str:
     return val.split("{", 1)[0].strip() if val else ""
 
@@ -224,7 +250,6 @@ def intervals_for_queue(queue_name: str, headers, rows):
     q = _clean_text(_strip_tpl(queue_name))
     if q not in cols or not times:
         return [], list(cols.keys())
-
     col_idx = _column_index(headers, q)
     if col_idx < 0:
         return [], list(cols.keys())
@@ -256,7 +281,7 @@ def format_intervals_readable(items, limit=16, from_now_only=True):
             break
     return "\n".join(out) if out else "На сьогодні інтервали не знайдені."
 
-# -------- КНОПКИ / МЕНЮ --------
+# ===== КНОПКИ / МЕНЮ =====
 def build_main_menu(chat_id: int):
     is_sub = chat_id in SUBSCRIBERS
     sub_text = "🔔 Слідкувати за оновленнями (увімкнено)" if is_sub else "🔕 Слідкувати за оновленнями (вимкнено)"
@@ -286,18 +311,18 @@ def build_queue_keyboard():
             cols = []
     if not cols:
         cols = [f"{a}.{b}" for a in range(1,7) for b in (1,2)]
-    rows = []
+    rows_kb = []
     row = []
     for i, c in enumerate(cols, 1):
         row.append(InlineKeyboardButton(c, callback_data=f"qsel:{c}"))
         if i % 4 == 0:
-            rows.append(row); row = []
+            rows_kb.append(row); row = []
     if row:
-        rows.append(row)
-    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="menu:main")])
-    return InlineKeyboardMarkup(rows)
+        rows_kb.append(row)
+    rows_kb.append([InlineKeyboardButton("⬅️ Назад", callback_data="menu:main")])
+    return InlineKeyboardMarkup(rows_kb)
 
-# -------- уведомления и джоб --------
+# ===== УВЕДОМЛЕНИЯ И ДЖОБ =====
 def notify(context, text, csv_rows=None):
     bot = context.bot
     dead = []
@@ -341,7 +366,7 @@ def check_job(context):
                 msg.append(f"• <code>{t}</code> — <b>{c}</b>: <code>{o or '—'}</code> → <code>{n or '—'}</code>")
         notify(context, "\n".join(msg), csv_rows)
 
-# ---------- команды ----------
+# ===== КОМАНДЫ =====
 def start_cmd(update, context):
     chat_id = update.effective_chat.id
     text = (f"Привіт! Відстежую таблицю {PAGE_URL}. Перевірка кожні {CHECK_INTERVAL_MIN} хв.\n"
@@ -420,7 +445,7 @@ def simulate_change_cmd(update, context):
     except Exception as e:
         update.message.reply_text(f"Помилка симуляції: {e}")
 
-# ---------- CALLBACK кнопок ----------
+# ===== CALLBACK =====
 def button_cb(update, context):
     global STATE, SUBSCRIBERS
     q = update.callback_query
@@ -463,6 +488,7 @@ def button_cb(update, context):
     except Exception:
         q.answer("Сталася помилка")
 
+# ===== MAIN =====
 def main():
     if not BOT_TOKEN:
         raise SystemExit("Укажи токен через переменную окружения BOT_TOKEN.")
@@ -470,23 +496,4 @@ def main():
     dp = updater.dispatcher
 
     dp.add_handler(CommandHandler("start", start_cmd))
-    dp.add_handler(CommandHandler("stop", stop_cmd))
-    dp.add_handler(CommandHandler("check", check_cmd))
-    dp.add_handler(CommandHandler("when", when_cmd))
-    dp.add_handler(CommandHandler("simulate_change", simulate_change_cmd))
-    dp.add_handler(CallbackQueryHandler(button_cb))
-
-    updater.job_queue.run_repeating(check_job, interval=CHECK_INTERVAL_MIN*60, first=0)
-    updater.start_polling(drop_pending_updates=True)
-    updater.idle()
-
-if __name__ == "__main__":
-    # страховка: требуем совместимую версию urllib3
-    try:
-        import urllib3
-        v = tuple(int(x) for x in urllib3.__version__.split(".")[:2])
-        if v >= (2,0):
-            raise SystemExit("Нужен urllib3<2 для PTB 13.15. Установи: pip install 'urllib3<2'")
-    except Exception:
-        pass
-    main()
+    dp.add_handler(CommandHandler("stop", stop_cmd)
