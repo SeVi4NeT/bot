@@ -1,63 +1,98 @@
 # -*- coding: utf-8 -*-
 # Совместим с python-telegram-bot v13.x (sync API, Updater/Dispatcher)
 
-import csv, hashlib, json, re, requests, time, warnings, os, tempfile
+import csv, hashlib, json, re, requests, time, warnings, os, sys, tempfile, logging, platform
 from io import BytesIO
 from pathlib import Path
 from bs4 import BeautifulSoup
 from telegram import InputFile, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import Updater, CommandHandler, CallbackQueryHandler
 
-# === ДОП. ИМПОРТЫ ДЛЯ /when ===
 from datetime import datetime, date, time as dtime, timedelta
 import pytz   # pip install pytz
 TZ = pytz.timezone("Europe/Kyiv")
 
-# Playwright для рендера JS (fallback)
-from playwright.sync_api import sync_playwright
+# Playwright для рендера JS (опциональный fallback)
+try:
+    from playwright.sync_api import sync_playwright
+    _PLAYWRIGHT_OK = True
+except Exception:
+    _PLAYWRIGHT_OK = False
 
 warnings.filterwarnings("ignore", category=UserWarning, module="telegram.utils.request")
 
-# === НАСТРОЙКИ ===
-BOT_TOKEN = "8328849866:AAEL0hvWYv-esVYVXTHVQ9rnl-kc-IImAIY"
-PAGE_URL = "https://off.energy.mk.ua"
-CHECK_INTERVAL_MIN = 1
-# "#tabSchedule table", ".tabSchedule .table-sm.table-bordered"
-TABLE_SELECTOR = ""   # оставь пустым — бот сам найдёт таблицу по "Час"
+# ─────────────────────────── НАСТРОЙКИ ───────────────────────────
 
-# --- папка данных в профиле пользователя ---
-DATA_DIR = Path(os.getenv("LOCALAPPDATA", str(Path.home()))) / "offenergy-bot"
+# !!! ВСТАВЬ СВОЙ ТОКЕН !!!
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip() or "8328849866:AAEL0hvWYv-esVYVXTHVQ9rnl-kc-IImAIY"
+
+# Адрес страницы с таблицей
+PAGE_URL = os.getenv("PAGE_URL", "https://off.energy.mk.ua").strip()
+
+# Период проверки (мин)
+CHECK_INTERVAL_MIN = int(os.getenv("CHECK_INTERVAL_MIN", "1"))
+
+# Если знаешь точный селектор таблицы — укажи; иначе оставь пустым
+TABLE_SELECTOR = os.getenv("TABLE_SELECTOR", "").strip()   # например: "#tabSchedule table"
+
+# Папка с данными (можно переопределить через DATA_DIR)
+def _default_data_dir() -> Path:
+    if os.getenv("DATA_DIR"):
+        return Path(os.getenv("DATA_DIR"))
+    # Кросс-платформенный дефолт
+    if platform.system().lower().startswith("win"):
+        base = Path(os.getenv("LOCALAPPDATA", str(Path.home())))
+    else:
+        base = Path(os.getenv("XDG_DATA_HOME", Path.home() / ".local" / "share"))
+    return Path(base) / "offenergy-bot"
+
+DATA_DIR = _default_data_dir()
 DATA_DIR.mkdir(parents=True, exist_ok=True)
-
 STATE_FILE = DATA_DIR / "state_table.json"
 SUBSCRIBERS_FILE = DATA_DIR / "subscribers.json"
+
+# Логирование
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
+log = logging.getLogger("offenergy-bot")
+
+# ─────────────────────────── ВСПОМОГАТЕЛЬНОЕ ───────────────────────────
+
 _whitespace_re = re.compile(r"\s+")
 
 def load_json(path: Path, default):
     if path.exists():
         try:
             return json.loads(path.read_text(encoding="utf-8"))
-        except Exception:
+        except Exception as e:
+            log.warning("load_json(%s) failed: %s", path, e)
             return default
     return default
 
 def save_json(path: Path, data):
-    """Атомная запись JSON с запасным путём на случай запрета записи."""
+    """Атомная запись JSON с запасным путём."""
     txt = json.dumps(data, ensure_ascii=False, indent=2)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(path.suffix + ".tmp")
         tmp.write_text(txt, encoding="utf-8")
-        tmp.replace(path)  # атомная замена
+        tmp.replace(path)
     except PermissionError:
         fallback = Path(tempfile.gettempdir()) / ("offenergy-bot_" + path.name)
         fallback.write_text(txt, encoding="utf-8")
+    except Exception as e:
+        log.error("save_json(%s) failed: %s", path, e)
 
 STATE = load_json(STATE_FILE, {})
 SUBSCRIBERS = set(load_json(SUBSCRIBERS_FILE, []))
 
 def _clean_text(s: str) -> str:
-    if not s: return ""
+    if not s:
+        return ""
     return _whitespace_re.sub(" ", s.replace("\xa0", " ")).strip()
 
 def normalize_cell_text(tag, include_class=False):
@@ -68,6 +103,16 @@ def normalize_cell_text(tag, include_class=False):
         if classes or style:
             text = f"{text}{{{classes}|{style}}}"
     return text
+
+def _make_soup(html: str):
+    # Сначала быстрый парсер lxml, затем встроенный html.parser
+    for parser in ("lxml", "html.parser"):
+        try:
+            return BeautifulSoup(html, parser)
+        except Exception as e:
+            log.debug("_make_soup with parser=%s failed: %s", parser, e)
+            continue
+    raise RuntimeError("Нет рабочего HTML-парсера (нужно установить 'lxml').")
 
 def _extract_table_from_soup(soup):
     table = soup.select_one(TABLE_SELECTOR) if TABLE_SELECTOR else None
@@ -106,35 +151,42 @@ def _looks_unrendered(headers, rows):
             count_tpl += 1
     return count_tpl >= 2
 
-def fetch_table():
-    # 1) пробуем обычный GET
-    r = requests.get(
-        PAGE_URL, timeout=60,
-        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-    )
-    r.raise_for_status()
-    soup = BeautifulSoup(r.text, "lxml")
-    headers, rows = _extract_table_from_soup(soup)
+# ─────────────────────────── ЗАГРУЗКА ТАБЛИЦЫ ───────────────────────────
 
-    # 2) если таблица не найдена или выглядит «сырой», рендерим через Playwright
-    if headers is None or _looks_unrendered(headers, rows):
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            ctx = browser.new_context()
-            page = ctx.new_page()
-            page.goto(PAGE_URL, wait_until="load", timeout=30000)
-            try:
-                sel = TABLE_SELECTOR or "table"
-                page.wait_for_selector(sel, timeout=20000)
-            except Exception:
-                pass
-            html = page.content()
-            browser.close()
-        soup2 = BeautifulSoup(html, "lxml")
-        headers, rows = _extract_table_from_soup(soup2)
+_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36"
+
+def fetch_table():
+    # 1) обычный GET
+    r = requests.get(PAGE_URL, timeout=60, headers={"User-Agent": _UA})
+    r.raise_for_status()
+    soup = _make_soup(r.text)
+    headers, rows = _extract_table_from_soup(soup)
+    need_render = (headers is None or _looks_unrendered(headers, rows))
+
+    # 2) если нужно — пробуем Playwright (мягко)
+    if need_render and _PLAYWRIGHT_OK:
+        try:
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
+                ctx = browser.new_context()
+                page = ctx.new_page()
+                page.goto(PAGE_URL, wait_until="networkidle", timeout=45000)
+                try:
+                    sel = TABLE_SELECTOR or "table"
+                    page.wait_for_selector(sel, timeout=20000)
+                except Exception:
+                    pass
+                html = page.content()
+                browser.close()
+            soup2 = _make_soup(html)
+            headers2, rows2 = _extract_table_from_soup(soup2)
+            if headers2 and rows2:
+                headers, rows = headers2, rows2
+        except Exception as e:
+            log.warning("Playwright fallback failed: %s", e)
 
     if not headers or not rows:
-        raise RuntimeError("Не удалось найти таблицу на странице")
+        raise RuntimeError("Не удалось найти таблицу (после GET и Playwright).")
 
     return headers, rows
 
@@ -160,13 +212,12 @@ def diff_tables(prev_headers, prev_rows, headers, rows, cap=30):
                     changes_preview.append((time_val, col, old.split("{")[0], new.split("{")[0]))
     return changes_preview, changes_all
 
-# ========= ФУНКЦИИ ДЛЯ /when =========
+# ─────────────────────────── ЛОГИКА /when ───────────────────────────
+
 def clean_cell(val: str) -> str:
     return val.split("{", 1)[0].strip() if val else ""
 
-# --- ЦВЕТ -> СОСТОЯНИЕ ---
 def _parse_cell_meta(val: str):
-    """Разбор хвоста {classes|style} -> (classes, style) в lowercase."""
     classes, style = "", ""
     if val and "{" in val and "}" in val:
         meta = val.split("{", 1)[1].split("}", 1)[0]
@@ -176,15 +227,12 @@ def _parse_cell_meta(val: str):
     return classes, style
 
 def _is_on_by_color(classes: str, style: str) -> bool:
-    """Зелёный = є світло. Учитываем точные классы/цвета страницы."""
     c = classes.lower().strip()
     s = style.lower().replace(" ", "")
-    # точные правила
     if "item-enable" in c:
         return True
     if "#a1eebd" in s or "rgb(161,238,189)" in s:
         return True
-    # запасные общие признаки
     if any(k in c for k in ("table-success", "bg-success", "text-bg-success", "green")):
         return True
     if any(h in s for h in ("#28a745", "#198754", "#2ecc71", "#00ff00", "background:green", "background-color:green")):
@@ -192,16 +240,13 @@ def _is_on_by_color(classes: str, style: str) -> bool:
     return False
 
 def _is_off_by_color(classes: str, style: str) -> bool:
-    """Жёлтый/красный = немає світла. Учитываем точные классы/цвета страницы."""
     c = classes.lower().strip()
     s = style.lower().replace(" ", "")
-    # точные правила
     if "item-off" in c or "item-probably" in c:
         return True
-    if ("#f6d6d6" in s or "rgb(246,214,214)" in s or   # красный
-        "#f6f7c4" in s or "rgb(246,247,196)" in s):     # жёлтый
+    if ("#f6d6d6" in s or "rgb(246,214,214)" in s or
+        "#f6f7c4" in s or "rgb(246,247,196)" in s):
         return True
-    # запасные общие признаки
     if any(k in c for k in ("table-warning", "table-danger", "bg-warning", "bg-danger",
                             "text-bg-warning", "text-bg-danger", "warning", "danger", "yellow", "red")):
         return True
@@ -212,7 +257,6 @@ def _is_off_by_color(classes: str, style: str) -> bool:
     return False
 
 def _cell_state_by_color(queue_name: str, val: str) -> str:
-    """'on'/'off' по цвету; fallback — сравнение текста с названием очереди."""
     text = clean_cell(val)
     classes, style = _parse_cell_meta(val)
     if _is_off_by_color(classes, style):
@@ -222,7 +266,6 @@ def _cell_state_by_color(queue_name: str, val: str) -> str:
     return "off" if text == queue_name else "on"
 
 def parse_time_range(s: str):
-    """Парсинг 'HH:MM-HH:MM' или 'HH:MM–HH:MM' (любой дефис/пробелы)."""
     s = str(s).strip().replace("–", "-").replace("—", "-").replace(" ", "").replace("\xa0", "")
     if not s or "-" not in s:
         return None, None
@@ -263,12 +306,6 @@ def _column_index(headers, q):
     return -1
 
 def intervals_for_queue(queue_name: str, headers, rows):
-    """
-    Возвращает интервалы:
-      [ (start_dt, end_dt, 'off'|'on') ]
-    Правило: цвет ячейки — главный (зелёный=on, жёлтый/красный=off).
-    Если цвета нет — fallback по тексту.
-    """
     times, cols = build_schedule_map(headers, rows)
     q = _clean_text(queue_name)
     if q not in cols or not times:
@@ -307,9 +344,9 @@ def format_intervals_readable(items, limit=16, from_now_only=True):
     if not out:
         return "На сьогодні інтервали не знайдені."
     return "\n".join(out)
-# ========= КОНЕЦ БЛОКА /when =========
 
-# -------- КНОПКИ / МЕНЮ --------
+# ─────────────────────────── КНОПКИ / МЕНЮ ───────────────────────────
+
 def build_main_menu(chat_id: int):
     is_sub = chat_id in SUBSCRIBERS
     sub_text = "🔔 Слідкувати за оновленнями (увімкнено)" if is_sub else "🔕 Слідкувати за оновленнями (вимкнено)"
@@ -321,7 +358,6 @@ def build_main_menu(chat_id: int):
     return InlineKeyboardMarkup(keyboard)
 
 def _known_columns():
-    """Вернуть список доступных колонок (без первого столбца времени)."""
     cols = []
     if STATE.get("headers"):
         cols = [_clean_text(h) for h in STATE["headers"][1:]]
@@ -329,19 +365,17 @@ def _known_columns():
 
 def build_queue_keyboard():
     cols = _known_columns()
-    # если ещё не загружено — попробуем подгрузить
     if not cols:
         try:
             headers, rows = fetch_table()
             STATE.update({"headers": headers, "rows": rows})
             save_json(STATE_FILE, STATE)
             cols = [_clean_text(h) for h in headers[1:]]
-        except Exception:
+        except Exception as e:
+            log.warning("build_queue_keyboard: fetch_table failed: %s", e)
             cols = []
     if not cols:
-        # запасной набор кнопок
         cols = [f"{a}.{b}" for a in range(1,7) for b in (1,2)]
-    # раскладываем по 4 кнопки в ряд
     rows = []
     row = []
     for i, c in enumerate(cols, 1):
@@ -378,7 +412,8 @@ def notify(context, text, csv_rows=None):
                     parse_mode='HTML',
                     disable_web_page_preview=False
                 )
-        except Exception:
+        except Exception as e:
+            log.warning("notify to %s failed: %s", chat_id, e)
             dead.append(chat_id)
     for d in dead:
         SUBSCRIBERS.discard(d)
@@ -388,7 +423,8 @@ def check_job(context):
     global STATE
     try:
         headers, rows = fetch_table()
-    except Exception:
+    except Exception as e:
+        log.warning("check_job: fetch_table failed: %s", e)
         return
     sig = table_signature(headers, rows)
     if not STATE:
@@ -407,7 +443,8 @@ def check_job(context):
                 msg.append(f"• <code>{t}</code> — <b>{c}</b>: <code>{o or '—'}</code> → <code>{n or '—'}</code>")
         notify(context, "\n".join(msg), csv_rows)
 
-# ---------- КОМАНДЫ ----------
+# ─────────────────────────── КОМАНДЫ ───────────────────────────
+
 def start_cmd(update, context):
     chat_id = update.effective_chat.id
     text = (f"Привіт! Відстежую таблицю {PAGE_URL}. Перевірка кожні {CHECK_INTERVAL_MIN} хв.\n"
@@ -436,7 +473,8 @@ def when_cmd(update, context):
             headers, rows = fetch_table()
             STATE.update({"headers": headers, "rows": rows})
             save_json(STATE_FILE, STATE)
-        except Exception:
+        except Exception as e:
+            log.warning("when_cmd: fetch_table failed: %s", e)
             update.message.reply_text("Не вдалось отримати таблицю зараз. Спробуйте ще раз.")
             return
     headers = STATE.get("headers", [])
@@ -449,7 +487,8 @@ def when_cmd(update, context):
     text = f"<b>Черга {queue} — сьогодні</b>\n" + format_intervals_readable(intervals)
     update.message.reply_text(text, parse_mode='HTML', reply_markup=build_main_menu(update.effective_chat.id))
 
-# ---------- CALLBACKS (кнопки) ----------
+# ─────────────────────────── CALLBACKS ───────────────────────────
+
 def button_cb(update, context):
     global STATE, SUBSCRIBERS
     q = update.callback_query
@@ -491,13 +530,13 @@ def button_cb(update, context):
 
         if data.startswith("qsel:"):
             queue = data.split(":", 1)[1]
-            # убедимся, что таблица есть
             if not STATE.get("headers"):
                 try:
                     headers, rows = fetch_table()
                     STATE.update({"headers": headers, "rows": rows})
                     save_json(STATE_FILE, STATE)
-                except Exception:
+                except Exception as e:
+                    log.warning("button_cb: fetch_table failed: %s", e)
                     q.answer("Не вдалося завантажити таблицю")
                     return
             headers = STATE.get("headers", [])
@@ -510,14 +549,16 @@ def button_cb(update, context):
             q.edit_message_text(text, parse_mode='HTML', reply_markup=build_queue_keyboard())
             return
 
-        # на всякий
         q.answer()
-    except Exception:
+    except Exception as e:
+        log.exception("button_cb failed: %s", e)
         q.answer("Сталася помилка")
 
+# ─────────────────────────── MAIN ───────────────────────────
+
 def main():
-    if not BOT_TOKEN:
-        raise SystemExit("Укажи BOT_TOKEN в начале файла.")
+    if not BOT_TOKEN or "PASTE_YOUR_TELEGRAM_BOT_TOKEN" in BOT_TOKEN:
+        raise SystemExit("Укажи BOT_TOKEN (переменная окружения или в коде).")
     updater = Updater(token=BOT_TOKEN, use_context=True)
     dp = updater.dispatcher
 
@@ -528,6 +569,7 @@ def main():
     dp.add_handler(CallbackQueryHandler(button_cb))
 
     updater.job_queue.run_repeating(check_job, interval=CHECK_INTERVAL_MIN*60, first=0)
+    log.info("Bot started. PAGE_URL=%s, DATA_DIR=%s", PAGE_URL, DATA_DIR)
     updater.start_polling(drop_pending_updates=True)
     updater.idle()
 
